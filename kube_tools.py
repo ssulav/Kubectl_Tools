@@ -4,6 +4,7 @@ import os
 import sys
 import logging
 import time
+import subprocess
 
 from configparser import ConfigParser
 from string import Template
@@ -65,31 +66,109 @@ class KubectlTools:
 
         # Checking for Required Argument FilePath
         if len_arg >= 1 and sys.argv[1]:
+            # Normalize to absolute path for reliability across callers
             self.file_path = sys.argv[1]
+            if not os.path.isabs(self.file_path):
+                self.file_path = os.path.abspath(self.file_path)
             logger.info("file_path = %s", self.file_path)
         else:
             logger.error("$FilePath$ is missing from Arguments")
             self.__print_usage_and_exit()
 
-        # Checking for Required Argument ProjectName
+        # Derive project name from repository when possible, or use provided argument
+        inferred_project = self.__infer_project_name_from_path(self.file_path)
+        provided_project = None
         if len_arg >= 2 and sys.argv[2]:
-            self.project_name = sys.argv[2]
-            logger.info("project_name = %s", self.project_name)
+            provided_project = sys.argv[2]
+            self.project_name = provided_project
+            logger.info("project_name (provided) = %s", self.project_name)
         else:
-            logger.error("$ModuleName$ is missing from Arguments")
-            self.__print_usage_and_exit()
+            self.project_name = inferred_project
+            logger.info("project_name (inferred) = %s", self.project_name)
+
+        # If provided project name doesn't match the file's repository, prefer inferred
+        if provided_project and inferred_project and provided_project != inferred_project:
+            if provided_project not in self.file_path:
+                logger.warning("Provided project_name '%s' does not match file path repo '%s'. Using '%s'.",
+                               provided_project, inferred_project, inferred_project)
+                self.project_name = inferred_project
 
         # Checking for config file ktoolrc & creating if not exist
         if len_arg >= 3 and sys.argv[3]:
             self.ktoolrc_file = sys.argv[3]
             logger.warning("Using config file from %s", self.ktoolrc_file)
         else:
-            self.ktoolrc_file = os.path.join(os.getcwd(), CONF_FILENAME)
-            if os.path.isfile(self.ktoolrc_file):
+            # Prefer config colocated with this tool (Kubectl_Tools project)
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            candidate_paths = []
+            # 1) Kubectl_Tools dir
+            candidate_paths.append(os.path.join(script_dir, CONF_FILENAME))
+            # 2) Git repo root of the file being acted on
+            git_root = self.__find_git_root(os.path.dirname(self.file_path))
+            if git_root:
+                candidate_paths.append(os.path.join(git_root, CONF_FILENAME))
+            # 3) Current working directory
+            candidate_paths.append(os.path.join(os.getcwd(), CONF_FILENAME))
+
+            self.ktoolrc_file = next((p for p in candidate_paths if os.path.isfile(p)), None)
+            if self.ktoolrc_file:
                 logger.warning("Using config file from %s", self.ktoolrc_file)
             else:
-                logger.warning("No config file found! Using default configurations")
+                # Default: create in Kubectl_Tools directory
+                self.ktoolrc_file = os.path.join(script_dir, CONF_FILENAME)
+                logger.warning("No config file found! Writing default to %s", self.ktoolrc_file)
                 self.__write_conf_to_file()
+
+    @staticmethod
+    def __find_git_root(start_dir):
+        try:
+            result = subprocess.run([
+                "git", "-C", start_dir, "rev-parse", "--show-toplevel"
+            ], capture_output=True, text=True, check=True)
+            git_root = result.stdout.strip()
+            return git_root if git_root else None
+        except Exception:
+            return None
+
+    def __infer_project_name_from_path(self, abs_file_path):
+        """Infer the repository name (top-level folder) for the given file path.
+
+        Priority:
+          1) git rev-parse --show-toplevel
+          2) Detect after 'github' segment in the absolute path
+          3) Known repository names present in the path
+        """
+        # 1) Try git
+        try:
+            file_dir = os.path.dirname(abs_file_path)
+            result = subprocess.run([
+                "git", "-C", file_dir, "rev-parse", "--show-toplevel"
+            ], capture_output=True, text=True, check=True)
+            git_root = result.stdout.strip()
+            if git_root:
+                return os.path.basename(git_root)
+        except Exception:
+            pass
+
+        # 2) Try to locate after 'github' segment (e.g., /.../github/QE/ozone-qe/..)
+        parts = os.path.normpath(abs_file_path).split(os.sep)
+        try:
+            idx = parts.index("github")
+            if idx + 2 < len(parts):
+                return parts[idx + 2]
+        except ValueError:
+            pass
+
+        # 3) Fallback: check for known repo names in the path
+        known_repos = [
+            "beaver-qe", "beaver-common", "ozone-qe", "Kubectl_Tools"
+        ]
+        for repo in known_repos:
+            if repo in abs_file_path:
+                return repo
+
+        # Last resort: top-most folder under the user's workspace path
+        return parts[0] if parts else ""
 
     def __read_and_validate_config_file(self):
         self.cur_config.optionxform = str
@@ -139,7 +218,7 @@ class KubectlTools:
 
     @staticmethod
     def __print_usage_and_exit():
-        print(f"{YELLOW_COLOR_SEQ} {sys.argv[0]} <$FilePath$> <$ProjectName$> [ktoolrc_filepath] {RESET_SEQ}")
+        print(f"{YELLOW_COLOR_SEQ} {sys.argv[0]} <$FilePath$> [<$ProjectName$>] [ktoolrc_filepath] {RESET_SEQ}")
         sys.exit(-1)
 
     @staticmethod
@@ -160,6 +239,17 @@ class KubectlTools:
             dest_path = self.dest_path
             if os.path.isdir(self.file_path):
                 dest_path = os.path.dirname(self.dest_path)
+
+            # Ensure parent directory exists on container before copying
+            remote_dir_to_create = dest_path if os.path.isdir(self.file_path) else os.path.dirname(dest_path)
+            mkdir_cmd = f"mkdir -p {remote_dir_to_create}"
+            kexec_mkdir = Template(self.cur_config.get('command', 'kexec')).substitute(
+                podname=st_podname,
+                namespace=namespace,
+                command=mkdir_cmd
+            )
+            logger.info("[Running] cmd = %s", kexec_mkdir)
+            self.__run_command(kexec_mkdir)
 
             cmd_template = Template(self.cur_config.get('command', 'kcp'))
             kcp_command = cmd_template.substitute(src_path=self.file_path, namespace=namespace,

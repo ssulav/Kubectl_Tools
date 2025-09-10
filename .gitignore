@@ -79,6 +79,4 @@ venv.bak/
 #asdf
 .tool-versions
 
-# VSCode
-.vscode
-ktoolrc.ini
+

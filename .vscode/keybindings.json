@@ -1,0 +1,17 @@
+[
+  {
+    "key": "ctrl+shift+v",
+    "command": "workbench.action.tasks.runTask",
+    "args": "Kubectl Copy & Run"
+  },
+  {
+    "key": "ctrl+shift+c",
+    "command": "workbench.action.tasks.runTask",
+    "args": "Kubectl Copy Only"
+  },
+  {
+    "key": "ctrl+shift+r",
+    "command": "workbench.action.tasks.runTask",
+    "args": "Kubectl Run Only"
+  }
+]
