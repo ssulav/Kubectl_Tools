@@ -1,10 +1,11 @@
+// Add the following to Cursor > Settings > Tasks > Tasks.json
 {
     "version": "2.0.0",
     "tasks": [
       {
         "label": "Kubectl Copy & Run",
         "type": "process",
-        "command": "${env:KUBE_TOOLS_HOME}/kube_tools.py",
+        "command": "${workspaceFolder:Kubectl_Tools}/kube_tools.py",
         "args": [
           "${file}",
           "${workspaceFolderBasename}"
@@ -19,7 +20,7 @@
       {
         "label": "Kubectl Copy Only",
         "type": "process",
-        "command": "${env:KUBE_TOOLS_HOME}/kube_tools_copy.py",
+        "command": "${workspaceFolder:Kubectl_Tools}/kube_tools_copy.py",
         "args": [
           "${file}",
           "${workspaceFolderBasename}"
@@ -34,7 +35,22 @@
       {
         "label": "Kubectl Run Only",
         "type": "process",
-        "command": "${env:KUBE_TOOLS_HOME}/kube_tools_run_test.py",
+        "command": "${workspaceFolder:Kubectl_Tools}/kube_tools_run_test.py",
+        "args": [
+          "${file}",
+          "${workspaceFolderBasename}"
+        ],
+        "group": "test",
+        "presentation": {
+          "reveal": "always",
+          "panel": "new"
+        },
+        "problemMatcher": []
+      },
+      {
+        "label": "Kubectl Debug Test",
+        "type": "process",
+        "command": "${workspaceFolder:Kubectl_Tools}/kube_tools_debug_test.py",
         "args": [
           "${file}",
           "${workspaceFolderBasename}"

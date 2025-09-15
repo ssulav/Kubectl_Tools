@@ -37,6 +37,7 @@ DEFAULT_CONF = {
     'command': {
         'kcp': "/usr/local/bin/kubectl cp $src_path ${namespace}/${podname}:${dest_path}",
         'kexec': "/usr/local/bin/kubectl exec -t $podname -n $namespace -c system-test -- $command",
+        'kpf': "/usr/local/bin/kubectl port-forward pod/$podname -n $namespace $debug_port:$debug_port --address 127.0.0.1",
         'sudo_login_and_run': "sudo su - hrt_qa -c \"$run_command\" ",
         'login_and_run': "su -c \"$run_command\" ",
         'texas_entry': "pkill supervisord && texas_test_entrypoint --test-type system_test"
@@ -44,7 +45,10 @@ DEFAULT_CONF = {
         'ansible_play': "ansible-playbook $yaml_file",
         'cd_and_run': "source /etc/profile && cd $test_dir && $test_command",
         'pytest': "python3 -m pytest -s $test_file_path --output=artifacts_${test_name} 2>&1"
-                  " | tee /tmp/console_${test_name}.log"
+                  " | tee /tmp/console_${test_name}.log",
+        'pytest_debug': "python3 -m debugpy --wait-for-client --listen 0.0.0.0:$debug_port -m pytest -s $test_file_path"
+                        " --output=artifacts_${test_name} 2>&1 | tee /tmp/console_${test_name}.log",
+        'debug_port': '5678'
     }
 }
 
@@ -60,6 +64,16 @@ class KubectlTools:
         self.__check_and_validate_parameters()
         self.__read_and_validate_config_file()
         self.__map_src_to_dest_path()
+
+    def __get_command(self, command_key):
+        if self.cur_config.has_option('command', command_key):
+            return self.cur_config.get('command', command_key)
+        default_value = DEFAULT_CONF.get('command', {}).get(command_key)
+        if default_value:
+            logger.warning("Command '%s' missing in %s; using default.", command_key, self.ktoolrc_file)
+            return default_value
+        logger.error("Command '%s' not found in config and no default available.", command_key)
+        sys.exit(1)
 
     def __check_and_validate_parameters(self):
         len_arg = len(sys.argv[1:])
@@ -288,6 +302,91 @@ class KubectlTools:
 
         logger.info("[Running] cmd = %s", kexec_cmd)
         return self.__run_command(kexec_cmd)
+
+    def kubectl_debug_test_on_container(self):
+        """Run tests under debugpy, waiting for an external debugger to attach on port 5678.
+
+        To debug: port-forward 5678 from the pod to localhost, then attach VS Code to localhost:5678.
+        """
+        st_podname = self.cur_config.get('container', 'podname')
+        namespace = self.cur_config.get('container', 'namespace')
+
+        if self.file_path.endswith(('.yaml', '.yml')):
+            logger.error("Debug mode is intended for Python tests, not YAML playbooks.")
+            return False
+        # Start port-forward locally in background
+        debug_port = Template(self.__get_command('debug_port')).substitute()
+        logger.info("[Running - DEBUG] debug_port: %s", debug_port)
+        debug_port = int(debug_port)
+        # Free up local and remote debug ports/processes from earlier runs
+        local_pkill_pf = f"pkill -f 'kubectl port-forward .* {debug_port}:{debug_port}' || true"
+        logger.info("[Running - DEBUG] cleanup local port-forward: %s", local_pkill_pf)
+        self.__run_command(local_pkill_pf)
+
+        remote_pkill_debug = "pkill -f debugpy || pkill -f 'python3 -m debugpy' || true"
+        kexec_remote_pkill = Template(self.cur_config.get('command', 'kexec')).substitute(
+            podname=st_podname,
+            namespace=namespace,
+            command=remote_pkill_debug
+        )
+        logger.info("[Running - DEBUG] cleanup remote debugpy: %s", kexec_remote_pkill)
+        self.__run_command(kexec_remote_pkill)
+
+        # Ensure debugpy is available in the container
+        install_cmd = "python3 -m pip install -q --user debugpy || true"
+        login_install_cmd = Template(self.cur_config.get('command', 'sudo_login_and_run')).substitute(
+            run_command=install_cmd
+        )
+        kexec_install_cmd = Template(self.cur_config.get('command', 'kexec')).substitute(
+            podname=st_podname,
+            namespace=namespace,
+            command=login_install_cmd
+        )
+        logger.info("[Running - DEBUG] ensure debugpy: %s", kexec_install_cmd)
+        self.__run_command(kexec_install_cmd)
+
+
+        pf_cmd = Template(self.__get_command('kpf')).substitute(
+            podname=st_podname,
+            namespace=namespace,
+            debug_port=debug_port
+        )
+        pf_bg_cmd = f"nohup {pf_cmd} > /tmp/kpf_{st_podname}_{debug_port}.log 2>&1 &"
+        logger.info("[Running - DEBUG] port-forward: %s", pf_bg_cmd)
+        self.__run_command(pf_bg_cmd)
+
+        logger.info("Running in Debug mode.")
+        test_dir = self.cur_config.get('mapping', 'dst_test_dir')
+        relative_path = os.path.relpath(self.dest_path, test_dir)
+        test_name = os.path.basename(self.dest_path).split('.')[0] + '_' + str(int(time.time()))
+
+        pytest_cmd = Template(self.__get_command('pytest_debug')).substitute(
+            test_file_path=relative_path,
+            test_name=test_name,
+            debug_port=debug_port
+        )
+        cmd = Template(self.cur_config.get('command', 'cd_and_run')).substitute(
+            test_dir=test_dir,
+            test_command=pytest_cmd
+        )
+        login_run_cmd = Template(self.cur_config.get('command', 'sudo_login_and_run')).substitute(
+            run_command=cmd
+        )
+        kexec_cmd = Template(self.cur_config.get('command', 'kexec')).substitute(
+            podname=st_podname,
+            namespace=namespace,
+            command=login_run_cmd
+        )
+
+        logger.info("[Running - DEBUG] cmd = %s", kexec_cmd)
+        logger.warning("Debug mode: ensure 'debugpy' is installed in container and port-forward %s.", debug_port)
+        try:
+            return self.__run_command(kexec_cmd)
+        finally:
+            # Stop local port-forward started earlier
+            stop_pf_cmd = f"pkill -f 'kubectl port-forward .* {debug_port}:{debug_port}' || true"
+            logger.info("[Running - DEBUG] stop port-forward: %s", stop_pf_cmd)
+            self.__run_command(stop_pf_cmd)
 
 
 if __name__ == '__main__':

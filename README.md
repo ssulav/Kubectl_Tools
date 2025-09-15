@@ -18,6 +18,7 @@ Refer Pycharm [Create/Edit/Copy Tool Dialog!](https://www.jetbrains.com/help/pyc
   * For **Kubectl Copy & Run** select `kube_tools.py`
   * For **Kubectl Copy Only** select `kube_tools_copy.py`
   * For **Kubectl Run Only** select `kube_tools_run_test.py`
+  * For **Kubectl Debug Test** select `kube_tools_debug_test.py`
 * In `Arguments` field enter Two Arguments `$FilePath$` and `$ModuleName$`
 * In `Working Directory` field enter `$ProjectFileDir$` or **Kubectl_Tools** Project Dir (Optional)
 * Click OK and Apply then you are ready to go!
@@ -50,3 +51,79 @@ are picked up by the `ini` file.
 * Unable to run kubectl commands?
   - Before using this tool, make sure you have kubectl package installed in your system.
   - Make sure basic kubectl commands are working on your namespace.
+
+### Debug mode (VS Code)
+
+These are the minimal changes a user needs to run tests in the container under a Python debugger.
+
+- Configure `ktoolrc.ini`
+  - Set your pod and optional namespace under `[container]`.
+  - Optionally set the debug port (default `5678`) under `[command]`.
+
+```ini
+[container]
+podname = <your-pod-name>
+namespace = <your-namespace>
+
+[command]
+debug_port = 5678
+```
+
+- Add VS Code debug configuration in `ozone-qe/.vscode/launch.json`
+
+```json
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Attach to debugpy (container)",
+      "type": "python",
+      "request": "attach",
+      "connect": { "host": "127.0.0.1", "port": 5678 },
+      "justMyCode": false,
+      "subProcess": true,
+      "pathMappings": [
+        { "localRoot": "${workspaceFolder:ozone-qe}", "remoteRoot": "/hwqe/hadoopqe" }
+      ]
+    }
+  ]
+}
+```
+
+Note: Update absolute paths
+- Set workspace variables, prefer `${workspaceFolder:Kubectl_Tools}` and `${workspaceFolder:ozone-qe}` to avoid hardcoded paths.
+- If your tasks/launch configs reference absolute script paths like `${workspaceFolder:ozone-qe}...`, update them to your environment.
+
+#### Multi-root workspace variables (recommended)
+
+Open a workspace that includes both repos (File → Open Workspace). Example `ozone-qe.code-workspace`:
+
+```json
+{
+  "folders": [
+    { "name": "Kubectl_Tools", "path": "../Kubectl_Tools" },
+    { "name": "ozone-qe", "path": "ozone-qe" }
+  ]
+}
+```
+
+- Run a debug session
+  1. Set breakpoints in your test file in `ozone-qe`.
+  2. Run the task "Kubectl Debug Test".
+  3. Start the VS Code configuration "Attach to debugpy (container)" or Run Debugger.
+  4. Execution will pause at breakpoints.
+
+Example (attached and paused at a breakpoint):
+
+![Debugger attached example](images/debugger_example.png)
+
+- What the tool does automatically
+  - Copies your test into the container and maps the destination path.
+  - Ensures `debugpy` is installed inside the container.
+  - Starts `kubectl port-forward` in the background to `${debug_port}` (log: `/tmp/kpf_<pod>_<port>.log`).
+  - Launches pytest with `--wait-for-client` so you can attach before execution.
+
+- Troubleshooting
+  - Port check: `nc -vz 127.0.0.1 5678` should succeed while waiting.
+  - If breakpoints don't bind, verify `pathMappings` match container path (`/hwqe/hadoopqe`).
+  - As a probe, add `import debugpy; debugpy.breakpoint()` near the start of the test.
