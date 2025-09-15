@@ -23,7 +23,7 @@ Refer Pycharm [Create/Edit/Copy Tool Dialog!](https://www.jetbrains.com/help/pyc
 * In `Working Directory` field enter `$ProjectFileDir$` or **Kubectl_Tools** Project Dir (Optional)
 * Click OK and Apply then you are ready to go!
 
-![Screenshot External Tools](ss_externaltool.png)
+![Screenshot External Tools](images/ss_externaltool.png)
 
 ### How to Run KubeTools from IDE
 * Select the file or folder you want to copy or run tests on container.
