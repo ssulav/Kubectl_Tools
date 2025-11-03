@@ -6,6 +6,8 @@
         "label": "Kubectl Copy & Run",
         "type": "process",
         "command": "${workspaceFolder:Kubectl_Tools}/kube_tools.py",
+        "suppressTaskName": true,
+        "showReuseMessage": false,
         "args": [
           "${file}",
           "${workspaceFolderBasename}"
@@ -13,14 +15,17 @@
         "group": "test",
         "presentation": {
           "reveal": "always",
-          "panel": "new"
+          "panel": "dedicated"
         },
+        "runOptions": {"instanceLimit": 3},
         "problemMatcher": []
       },
       {
         "label": "Kubectl Copy Only",
         "type": "process",
         "command": "${workspaceFolder:Kubectl_Tools}/kube_tools_copy.py",
+        "suppressTaskName": true,
+        "showReuseMessage": false,
         "args": [
           "${file}",
           "${workspaceFolderBasename}"
@@ -28,14 +33,17 @@
         "group": "test",
         "presentation": {
           "reveal": "always",
-          "panel": "new"
+          "panel": "shared"
         },
+        "runOptions": {"instanceLimit": 5},
         "problemMatcher": []
       },
       {
         "label": "Kubectl Run Only",
         "type": "process",
         "command": "${workspaceFolder:Kubectl_Tools}/kube_tools_run_test.py",
+        "suppressTaskName": true,
+        "showReuseMessage": false,
         "args": [
           "${file}",
           "${workspaceFolderBasename}"
@@ -43,14 +51,17 @@
         "group": "test",
         "presentation": {
           "reveal": "always",
-          "panel": "new"
+          "panel": "dedicated"
         },
+        "runOptions": {"instanceLimit": 3},
         "problemMatcher": []
       },
       {
         "label": "Kubectl Debug Test",
         "type": "process",
         "command": "${workspaceFolder:Kubectl_Tools}/kube_tools_debug_test.py",
+        "suppressTaskName": true,
+        "showReuseMessage": false,
         "args": [
           "${file}",
           "${workspaceFolderBasename}"
