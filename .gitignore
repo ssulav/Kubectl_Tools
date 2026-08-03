@@ -79,4 +79,7 @@ venv.bak/
 #asdf
 .tool-versions
 
+# Downloaded kubeconfig (see README / secrets/README.md)
+secrets/config-rke
+
 

@@ -6,4 +6,9 @@ from kube_tools import KubectlTools
 # This script will Copy <$FILE_PATH$> to relevant <$PROJECT_NAME$> in the Container passed in 'ktoolrc.ini' file
 if __name__ == '__main__':
     kube_tool = KubectlTools()
-    kube_tool.kubectl_copy_to_container()
+    try:
+        kube_tool.kubectl_copy_to_container()
+    except KeyboardInterrupt:
+        raise
+    finally:
+        kube_tool.release_live_pool_reservation()

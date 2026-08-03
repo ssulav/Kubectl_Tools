@@ -9,7 +9,8 @@ Also, you can run:
 Refer Pycharm [Create/Edit/Copy Tool Dialog!](https://www.jetbrains.com/help/pycharm/settings-tools-create-edit-copy-tool-dialog.html)
 
 #### Steps to Create External Tools:
-* Clone this Repository in your local machine.
+* Clone this repository in your local machine.
+* Install the QE kubeconfig (see [Get Started on QE KubeConfig & KubectlTools](https://cloudera.atlassian.net/wiki/spaces/ENG/pages/10963091578/Get+Started+on+QE+KubeConfig+KubectlTools) below).
 * In Pycharm IDE, Go to Preferences (`⌘`+`,`)
 * Go to `External Tools` under **Tools** Section
 * Click on `+` icon to create a new Tool
@@ -24,6 +25,64 @@ Refer Pycharm [Create/Edit/Copy Tool Dialog!](https://www.jetbrains.com/help/pyc
 * Click OK and Apply then you are ready to go!
 
 ![Screenshot External Tools](images/ss_externaltool.png)
+
+## QE kubeconfig setup
+
+Kubectl_Tools runs all `kubectl` commands with a local `secrets/config-rke` file (not committed to git).
+
+1. Clone the repo:
+
+   ```bash
+   git clone git@github.infra.cloudera.com:QE/Kubectl_Tools.git
+   cd Kubectl_Tools
+   ```
+
+2. Follow the internal wiki to download the shared QE kubeconfig:
+   [Get Started on QE KubeConfig & KubectlTools](https://cloudera.atlassian.net/wiki/spaces/ENG/pages/10963091578/Get+Started+on+QE+KubeConfig+KubectlTools)
+
+3. Save the downloaded file as `secrets/config-rke` in this repository:
+
+   ```bash
+   chmod 600 secrets/config-rke
+   ```
+
+4. Verify access (optional):
+
+   ```bash
+   kubectl --kubeconfig secrets/config-rke get pods -n qainfra
+   ```
+
+If `secrets/config-rke` is missing, `kube_tools.py` exits with an error pointing at this section.
+
+See also `secrets/README.md`.
+
+### Live cluster pool reservation
+
+When the configured pod in `ktoolrc.ini` is not live, Kubectl Tools falls back to the
+[ozone-live-clusters](http://10.240.67.203:8083) primary pool. With `auto_reserve = true`
+(default), it:
+
+1. Tries pool slots in `pool_slot_ids` order (default `1,2`)
+2. Reserves the first slot still at the default reservation (`ozone-functional-team`)
+3. Runs the test on that pod
+4. Releases the reservation when the tool exits (success, failure, or copy-only)
+
+If every slot is already reserved or offline, the run is **skipped** (exit 0) with a warning.
+
+```ini
+[live_clusters]
+enabled = true
+api_url = http://10.240.67.203:8083
+pool_slot_ids = 1,2
+auto_reserve = true
+reserved_by =          ; defaults to $USER
+```
+
+Set `auto_reserve = false` to pick a live pool pod without claiming it (legacy behavior).
+
+Reservations are released automatically on normal exit, Ctrl+C, SIGTERM, or if the
+tool is stopped mid-run (`atexit` + signal handlers reset `reserved_by` to
+`ozone-functional-team`).
 
 ### How to Run KubeTools from IDE
 * Select the file or folder you want to copy or run tests on container.

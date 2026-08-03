@@ -1,6 +1,8 @@
 #!/usr/bin/python3
 
+import atexit
 import os
+import signal
 import sys
 import logging
 import time
@@ -8,6 +10,20 @@ import subprocess
 
 from configparser import ConfigParser
 from string import Template
+
+from live_pod import (
+    DEFAULT_KUBECONFIG,
+    DEFAULT_LIVE_CLUSTERS_URL,
+    DEFAULT_POOL_SLOT_IDS,
+    NoPoolAvailableError,
+    expand_path,
+    is_truthy,
+    parse_slot_ids,
+    release_live_pool_slot,
+    resolve_kubeconfig,
+    resolve_pod_target,
+    resolve_reserved_by,
+)
 
 
 # These are the sequences need to get colored output
@@ -29,22 +45,33 @@ DEFAULT_CONF = {
         'podname': '',
         'namespace': os.getenv('USER')
     },
+    'kubernetes': {
+        'kubeconfig': 'secrets/config-rke',
+        'pod_liveness_check': 'true',
+    },
+    'live_clusters': {
+        'enabled': 'true',
+        'api_url': DEFAULT_LIVE_CLUSTERS_URL,
+        'pool_slot_ids': ','.join(str(slot_id) for slot_id in DEFAULT_POOL_SLOT_IDS),
+        'auto_reserve': 'true',
+        'reserved_by': '',
+    },
     'mapping': {
         'dst_package_dir': '/usr/local/lib/python3.6/dist-packages',
         'dst_test_dir': '/hwqe/hadoopqe',
         'dst_yaml_dir': '/ansible'
     },
     'command': {
-        'kcp': "/usr/local/bin/kubectl cp $src_path ${namespace}/${podname}:${dest_path}",
-        'kexec': "/usr/local/bin/kubectl exec -t $podname -n $namespace -c system-test -- $command",
-        'kpf': "/usr/local/bin/kubectl port-forward pod/$podname -n $namespace $debug_port:$debug_port --address 127.0.0.1",
+        'kcp': "/usr/local/bin/kubectl --kubeconfig $kubeconfig cp $src_path ${namespace}/${podname}:${dest_path}",
+        'kexec': "/usr/local/bin/kubectl --kubeconfig $kubeconfig exec -t $podname -n $namespace -c system-test -- $command",
+        'kpf': "/usr/local/bin/kubectl --kubeconfig $kubeconfig port-forward pod/$podname -n $namespace $debug_port:$debug_port --address 127.0.0.1",
         'sudo_login_and_run': "sudo su - hrt_qa -c \"$run_command\" ",
         'login_and_run': "su -c \"$run_command\" ",
         'texas_entry': "pkill supervisord && texas_test_entrypoint --test-type system_test"
                        " --run-tests-path /ansible/system_test.yml",
         'ansible_play': "ansible-playbook $yaml_file",
         'cd_and_run': "source /etc/profile && cd $test_dir && $test_command",
-        'pytest': "python3 -m pytest -s $test_file_path --output=artifacts_${test_name} 2>&1"
+        'pytest': "python3 -m pytest $test_file_path --output=artifacts_${test_name} 2>&1"
                   " | tee /tmp/console_${test_name}.log",
         'pytest_debug': "python3 -m debugpy --wait-for-client --listen 0.0.0.0:$debug_port -m pytest -s $test_file_path"
                         " --output=artifacts_${test_name} 2>&1 | tee /tmp/console_${test_name}.log",
@@ -60,9 +87,19 @@ class KubectlTools:
         self.ktoolrc_file = None
         self.cur_config = ConfigParser()
         self.dest_path = None
+        self.kubeconfig = DEFAULT_KUBECONFIG
+        self.podname = None
+        self.namespace = None
+        self.pod_source = None
+        self.pool_slot_id = None
+        self.pool_reserved_by = None
+        self.live_clusters_api_url = DEFAULT_LIVE_CLUSTERS_URL
+        self._reservation_released = False
+        self._release_handlers_registered = False
 
         self.__check_and_validate_parameters()
         self.__read_and_validate_config_file()
+        self.__resolve_container_target()
         self.__map_src_to_dest_path()
 
     def __get_command(self, command_key):
@@ -184,6 +221,11 @@ class KubectlTools:
         # Last resort: top-most folder under the user's workspace path
         return parts[0] if parts else ""
 
+    def __config_get(self, section, option, default=None):
+        if self.cur_config.has_option(section, option):
+            return self.cur_config.get(section, option)
+        return default
+
     def __read_and_validate_config_file(self):
         self.cur_config.optionxform = str
         if os.path.isfile(self.ktoolrc_file):
@@ -191,15 +233,156 @@ class KubectlTools:
         else:
             logger.error("Give Config File [%s] doesn't exists!", self.ktoolrc_file)
             sys.exit(1)
+        self.kubeconfig = resolve_kubeconfig(
+            self.__config_get('kubernetes', 'kubeconfig', 'secrets/config-rke')
+        )
+        if not os.path.isfile(self.kubeconfig):
+            logger.error(
+                "Kubeconfig not found: %s\n"
+                "Download it from https://cloudera.atlassian.net/wiki/spaces/ENG/pages/10963091578/"
+                "Get+Started+on+QE+KubeConfig+KubectlTools and save as secrets/config-rke",
+                self.kubeconfig,
+            )
+            sys.exit(1)
         # Checking for podname
-        st_podname = self.cur_config.get('container', 'podname')
-        namespace = self.cur_config.get('container', 'namespace')
+        st_podname = self.__config_get('container', 'podname', '')
+        namespace = self.__config_get('container', 'namespace', os.getenv('USER'))
         if st_podname:
             logger.warning("Using podname = <%s>!\n\t--> If you want to change the podname, change it at <%s> file <--",
                            st_podname, self.ktoolrc_file)
         else:
             logger.error("Please set the value for 'podname' in the file %s", self.ktoolrc_file)
             sys.exit(1)
+        self.__ensure_kubectl_commands()
+
+    def __ensure_kubectl_commands(self):
+        if not self.cur_config.has_section('command'):
+            self.cur_config.add_section('command')
+        for key in ('kcp', 'kexec', 'kpf'):
+            current = self.__config_get('command', key, '')
+            default = DEFAULT_CONF['command'][key]
+            if not current or '$kubeconfig' not in current:
+                self.cur_config.set('command', key, default)
+                logger.warning(
+                    "Updated command.%s in %s to use kubeconfig-aware kubectl template",
+                    key,
+                    self.ktoolrc_file,
+                )
+
+    def __resolve_container_target(self):
+        configured_podname = self.__config_get('container', 'podname', '')
+        configured_namespace = self.__config_get('container', 'namespace', os.getenv('USER'))
+        pool_slot_ids = parse_slot_ids(
+            self.__config_get('live_clusters', 'pool_slot_ids', ''),
+            DEFAULT_POOL_SLOT_IDS,
+        )
+        self.live_clusters_api_url = self.__config_get(
+            'live_clusters',
+            'api_url',
+            DEFAULT_LIVE_CLUSTERS_URL,
+        )
+        try:
+            target = resolve_pod_target(
+                configured_podname,
+                configured_namespace,
+                kubeconfig=self.kubeconfig,
+                live_clusters_url=self.live_clusters_api_url,
+                pool_slot_ids=pool_slot_ids,
+                live_clusters_enabled=is_truthy(
+                    self.__config_get('live_clusters', 'enabled', 'true'),
+                    default=True,
+                ),
+                liveness_check_enabled=is_truthy(
+                    self.__config_get('kubernetes', 'pod_liveness_check', 'true'),
+                    default=True,
+                ),
+                auto_reserve=is_truthy(
+                    self.__config_get('live_clusters', 'auto_reserve', 'true'),
+                    default=True,
+                ),
+                reserved_by=resolve_reserved_by(
+                    self.__config_get('live_clusters', 'reserved_by', '')
+                ),
+            )
+        except NoPoolAvailableError as exc:
+            logger.warning("Skipping test run: %s", exc)
+            sys.exit(0)
+        except RuntimeError as exc:
+            logger.error("%s", exc)
+            sys.exit(1)
+
+        self.podname = target.podname
+        self.namespace = target.namespace
+        self.pod_source = target.source
+        self.pool_slot_id = target.slot_id
+        self.pool_reserved_by = target.reserved_by
+        logger.warning(
+            "Resolved target pod %s/%s (source: %s, kubeconfig: %s)",
+            self.namespace,
+            self.podname,
+            self.pod_source,
+            self.kubeconfig,
+        )
+        self.__install_pool_release_guard()
+
+    def __install_pool_release_guard(self):
+        """Release reserved pool slots on normal exit, Ctrl+C, SIGTERM, or kill."""
+        if self._release_handlers_registered or self.pool_slot_id is None or not self.pool_reserved_by:
+            return
+        self._release_handlers_registered = True
+        atexit.register(self.release_live_pool_reservation)
+
+        def _handle_stop(signum, _frame):
+            try:
+                sig_name = signal.Signals(signum).name
+            except (AttributeError, ValueError):
+                sig_name = str(signum)
+            logger.warning(
+                "Stopping (%s); releasing live pool slot %s for %s",
+                sig_name,
+                self.pool_slot_id,
+                self.pool_reserved_by,
+            )
+            self.release_live_pool_reservation()
+            raise SystemExit(128 + signum if signum in (signal.SIGINT, signal.SIGTERM) else 1)
+
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            try:
+                signal.signal(signum, _handle_stop)
+            except (ValueError, OSError):
+                pass
+
+    def release_live_pool_reservation(self):
+        if self._reservation_released or self.pool_slot_id is None or not self.pool_reserved_by:
+            return
+        slot_id = self.pool_slot_id
+        reserved_by = self.pool_reserved_by
+        self._reservation_released = True
+        self.pool_slot_id = None
+        self.pool_reserved_by = None
+        logger.info(
+            "Releasing live pool slot %s for %s",
+            slot_id,
+            reserved_by,
+        )
+        release_live_pool_slot(
+            self.live_clusters_api_url,
+            slot_id,
+            reserved_by,
+        )
+
+    def __container_target(self):
+        return self.podname, self.namespace
+
+    def __kubectl_substitution(self, **extra):
+        podname, namespace = self.__container_target()
+        values = {
+            'podname': podname,
+            'namespace': namespace,
+            'kubeconfig': self.kubeconfig,
+        }
+        values.update(extra)
+        return values
 
     def __map_src_to_dest_path(self):
         if self.project_name == "texas_test_entrypoint":  # self.file_path.endswith(('.yaml', '.yml'))
@@ -247,9 +430,6 @@ class KubectlTools:
     # Exposed Functions
     def kubectl_copy_to_container(self):
         if os.path.exists(self.file_path) and self.project_name in self.file_path:
-            st_podname = self.cur_config.get('container', 'podname')
-            namespace = self.cur_config.get('container', 'namespace')
-
             dest_path = self.dest_path
             if os.path.isdir(self.file_path):
                 dest_path = os.path.dirname(self.dest_path)
@@ -258,16 +438,18 @@ class KubectlTools:
             remote_dir_to_create = dest_path if os.path.isdir(self.file_path) else os.path.dirname(dest_path)
             mkdir_cmd = f"mkdir -p {remote_dir_to_create}"
             kexec_mkdir = Template(self.cur_config.get('command', 'kexec')).substitute(
-                podname=st_podname,
-                namespace=namespace,
-                command=mkdir_cmd
+                **self.__kubectl_substitution(command=mkdir_cmd)
             )
             logger.info("[Running] cmd = %s", kexec_mkdir)
             self.__run_command(kexec_mkdir)
 
             cmd_template = Template(self.cur_config.get('command', 'kcp'))
-            kcp_command = cmd_template.substitute(src_path=self.file_path, namespace=namespace,
-                                                  podname=st_podname, dest_path=dest_path)
+            kcp_command = cmd_template.substitute(
+                **self.__kubectl_substitution(
+                    src_path=self.file_path,
+                    dest_path=dest_path,
+                )
+            )
 
             logger.info("[Running] cmd = %s", kcp_command)
             return self.__run_command(kcp_command)
@@ -276,9 +458,6 @@ class KubectlTools:
             return False
 
     def kubectl_run_test_on_container(self):
-        st_podname = self.cur_config.get('container', 'podname')
-        namespace = self.cur_config.get('container', 'namespace')
-
         if self.file_path.endswith(('.yaml', '.yml')):
             if os.path.basename(self.file_path) == 'system_test.yml':
                 cmd = self.cur_config.get('command', 'texas_entry')
@@ -296,9 +475,9 @@ class KubectlTools:
             cmd = Template(self.cur_config.get('command', 'cd_and_run')).substitute(test_dir=test_dir,
                                                                                     test_command=pytest_cmd)
             login_run_cmd = Template(self.cur_config.get('command', 'sudo_login_and_run')).substitute(run_command=cmd)
-        kexec_cmd = Template(self.cur_config.get('command', 'kexec')).substitute(podname=st_podname,
-                                                                                 namespace=namespace,
-                                                                                 command=login_run_cmd)
+        kexec_cmd = Template(self.cur_config.get('command', 'kexec')).substitute(
+            **self.__kubectl_substitution(command=login_run_cmd)
+        )
 
         logger.info("[Running] cmd = %s", kexec_cmd)
         return self.__run_command(kexec_cmd)
@@ -308,9 +487,6 @@ class KubectlTools:
 
         To debug: port-forward 5678 from the pod to localhost, then attach VS Code to localhost:5678.
         """
-        st_podname = self.cur_config.get('container', 'podname')
-        namespace = self.cur_config.get('container', 'namespace')
-
         if self.file_path.endswith(('.yaml', '.yml')):
             logger.error("Debug mode is intended for Python tests, not YAML playbooks.")
             return False
@@ -325,9 +501,7 @@ class KubectlTools:
 
         remote_pkill_debug = "pkill -f debugpy || pkill -f 'python3 -m debugpy' || true"
         kexec_remote_pkill = Template(self.cur_config.get('command', 'kexec')).substitute(
-            podname=st_podname,
-            namespace=namespace,
-            command=remote_pkill_debug
+            **self.__kubectl_substitution(command=remote_pkill_debug)
         )
         logger.info("[Running - DEBUG] cleanup remote debugpy: %s", kexec_remote_pkill)
         self.__run_command(kexec_remote_pkill)
@@ -338,20 +512,17 @@ class KubectlTools:
             run_command=install_cmd
         )
         kexec_install_cmd = Template(self.cur_config.get('command', 'kexec')).substitute(
-            podname=st_podname,
-            namespace=namespace,
-            command=login_install_cmd
+            **self.__kubectl_substitution(command=login_install_cmd)
         )
         logger.info("[Running - DEBUG] ensure debugpy: %s", kexec_install_cmd)
         self.__run_command(kexec_install_cmd)
 
 
         pf_cmd = Template(self.__get_command('kpf')).substitute(
-            podname=st_podname,
-            namespace=namespace,
-            debug_port=debug_port
+            **self.__kubectl_substitution(debug_port=debug_port)
         )
-        pf_bg_cmd = f"nohup {pf_cmd} > /tmp/kpf_{st_podname}_{debug_port}.log 2>&1 &"
+        podname, _namespace = self.__container_target()
+        pf_bg_cmd = f"nohup {pf_cmd} > /tmp/kpf_{podname}_{debug_port}.log 2>&1 &"
         logger.info("[Running - DEBUG] port-forward: %s", pf_bg_cmd)
         self.__run_command(pf_bg_cmd)
 
@@ -373,9 +544,7 @@ class KubectlTools:
             run_command=cmd
         )
         kexec_cmd = Template(self.cur_config.get('command', 'kexec')).substitute(
-            podname=st_podname,
-            namespace=namespace,
-            command=login_run_cmd
+            **self.__kubectl_substitution(command=login_run_cmd)
         )
 
         logger.info("[Running - DEBUG] cmd = %s", kexec_cmd)
@@ -391,8 +560,14 @@ class KubectlTools:
 
 if __name__ == '__main__':
     kube_tool = KubectlTools()
-    if kube_tool.kubectl_copy_to_container():
-        kube_tool.kubectl_run_test_on_container()
-    else:
-        time.sleep(1)
-        logger.warning("Skipping KubeTool Run Test as Copy failed")
+    try:
+        if kube_tool.kubectl_copy_to_container():
+            kube_tool.kubectl_run_test_on_container()
+        else:
+            time.sleep(1)
+            logger.warning("Skipping KubeTool Run Test as Copy failed")
+    except KeyboardInterrupt:
+        logger.warning("Interrupted during test run")
+        raise
+    finally:
+        kube_tool.release_live_pool_reservation()
